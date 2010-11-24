@@ -17,8 +17,8 @@
   along with this program; if not, write to the Free Software
   Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
   
-  spike v0.1 loads and registers a spi driver for a device at the bus/
-  cable select specified by the constants SPI_BUS.SPI_BUS_CS1
+  spike v0.2 does a loopback write/read of 4 bytes. 
+  Jumper MOSI to MISO, expansion board pins 5 to 7, for testing.
 */
 
 #include <linux/init.h>
@@ -32,6 +32,7 @@
 #include <linux/string.h>
 #include <asm/uaccess.h>
 
+#define SPI_BUFF_SIZE	16
 #define USER_BUFF_SIZE	128
 
 #define SPI_BUS 1
@@ -41,6 +42,14 @@
 
 const char this_driver_name[] = "spike";
 
+struct spike_control {
+	struct spi_message msg;
+	struct spi_transfer transfer;
+	u8 *tx_buff; 
+	u8 *rx_buff;
+};
+
+static struct spike_control spike_ctl;
 
 struct spike_dev {
 	struct semaphore spi_sem;
@@ -50,10 +59,46 @@ struct spike_dev {
 	struct class *class;
 	struct spi_device *spi_device;
 	char *user_buff;
+	u8 test_data;	
 };
 
 static struct spike_dev spike_dev;
 
+
+static void spike_prepare_spi_message(void)
+{
+	spi_message_init(&spike_ctl.msg);
+
+	/* put some changing values in tx_buff for testing */	
+	spike_ctl.tx_buff[0] = spike_dev.test_data++;
+	spike_ctl.tx_buff[1] = spike_dev.test_data++;
+	spike_ctl.tx_buff[2] = spike_dev.test_data++;
+	spike_ctl.tx_buff[3] = spike_dev.test_data++;
+
+	memset(spike_ctl.rx_buff, 0, SPI_BUFF_SIZE);
+
+	spike_ctl.transfer.tx_buf = spike_ctl.tx_buff;
+	spike_ctl.transfer.rx_buf = spike_ctl.rx_buff;
+	spike_ctl.transfer.len = 4;
+
+	spi_message_add_tail(&spike_ctl.transfer, &spike_ctl.msg);
+}
+
+static int spike_do_one_message(void)
+{
+	int status;
+
+	if (down_interruptible(&spike_dev.spi_sem))
+		return -ERESTARTSYS;
+
+	spike_prepare_spi_message();
+
+	status = spi_sync(spike_dev.spi_device, &spike_ctl.msg);
+	
+	up(&spike_dev.spi_sem);
+
+	return status;	
+}
 
 static ssize_t spike_read(struct file *filp, char __user *buff, size_t count,
 			loff_t *offp)
@@ -70,17 +115,23 @@ static ssize_t spike_read(struct file *filp, char __user *buff, size_t count,
 	if (down_interruptible(&spike_dev.fop_sem)) 
 		return -ERESTARTSYS;
 
-	if (!spike_dev.spi_device)
-		strcpy(spike_dev.user_buff, "spi_device is NULL\n");
-	else if (!spike_dev.spi_device->master)
-		strcpy(spike_dev.user_buff, "spi_device->master is NULL\n");
-	else
-		sprintf(spike_dev.user_buff, "%s ready on SPI%d.%d\n",
-			this_driver_name,
-			spike_dev.spi_device->master->bus_num,
-			spike_dev.spi_device->chip_select);
+	status = spike_do_one_message();
 
-	
+	if (status) {
+		sprintf(spike_dev.user_buff, 
+			"spike_do_one_message failed : %d\n",
+			status);
+	}
+	else {
+		sprintf(spike_dev.user_buff, 
+			"Status: %d\nTX: %d %d %d %d\nRX: %d %d %d %d\n",
+			spike_ctl.msg.status,
+			spike_ctl.tx_buff[0], spike_ctl.tx_buff[1], 
+			spike_ctl.tx_buff[2], spike_ctl.tx_buff[3],
+			spike_ctl.rx_buff[0], spike_ctl.rx_buff[1], 
+			spike_ctl.rx_buff[2], spike_ctl.rx_buff[3]);
+	}
+		
 	len = strlen(spike_dev.user_buff);
  
 	if (len < count) 
@@ -165,6 +216,7 @@ static int __init add_spike_device_to_bus(void)
 		return -1;
 	}
 
+	/* CS1 = 0 */
 	spi_device->chip_select = SPI_BUS_CS1;
 
 	/* Check whether this SPI bus.cs is already claimed */
@@ -212,7 +264,7 @@ static int __init add_spike_device_to_bus(void)
 
 static struct spi_driver spike_driver = {
 	.driver = {
-		.name =	this_driver_name,
+		.name =	"spike",
 		.owner = THIS_MODULE,
 	},
 	.probe = spike_probe,
@@ -223,20 +275,46 @@ static int __init spike_init_spi(void)
 {
 	int error;
 
+	spike_ctl.tx_buff = kmalloc(SPI_BUFF_SIZE, GFP_KERNEL | GFP_DMA);
+	if (!spike_ctl.tx_buff) {
+		error = -ENOMEM;
+		goto spike_init_error;
+	}
+
+	spike_ctl.rx_buff = kmalloc(SPI_BUFF_SIZE, GFP_KERNEL | GFP_DMA);
+	if (!spike_ctl.rx_buff) {
+		error = -ENOMEM;
+		goto spike_init_error;
+	}
+
 	error = spi_register_driver(&spike_driver);
 	if (error < 0) {
 		printk(KERN_ALERT "spi_register_driver() failed %d\n", error);
-		return error;
+		goto spike_init_error;
 	}
 
 	error = add_spike_device_to_bus();
 	if (error < 0) {
 		printk(KERN_ALERT "add_spike_to_bus() failed\n");
 		spi_unregister_driver(&spike_driver);
-		return error;
+		goto spike_init_error;	
 	}
 
 	return 0;
+
+spike_init_error:
+
+	if (spike_ctl.tx_buff) {
+		kfree(spike_ctl.tx_buff);
+		spike_ctl.tx_buff = 0;
+	}
+
+	if (spike_ctl.rx_buff) {
+		kfree(spike_ctl.rx_buff);
+		spike_ctl.rx_buff = 0;
+	}
+	
+	return error;
 }
 
 static const struct file_operations spike_fops = {
@@ -294,6 +372,7 @@ static int __init spike_init_class(void)
 static int __init spike_init(void)
 {
 	memset(&spike_dev, 0, sizeof(spike_dev));
+	memset(&spike_ctl, 0, sizeof(spike_ctl));
 
 	sema_init(&spike_dev.spi_sem, 1);
 	sema_init(&spike_dev.fop_sem, 1);
@@ -320,7 +399,6 @@ fail_2:
 fail_1:
 	return -1;
 }
-module_init(spike_init);
 
 static void __exit spike_exit(void)
 {
@@ -332,15 +410,21 @@ static void __exit spike_exit(void)
 	cdev_del(&spike_dev.cdev);
 	unregister_chrdev_region(spike_dev.devt, 1);
 
+	if (spike_ctl.tx_buff)
+		kfree(spike_ctl.tx_buff);
+
+	if (spike_ctl.rx_buff)
+		kfree(spike_ctl.rx_buff);
+
 	if (spike_dev.user_buff)
 		kfree(spike_dev.user_buff);
 }
+
+module_init(spike_init);
 module_exit(spike_exit);
 
-
 MODULE_AUTHOR("Scott Ellis");
-MODULE_DESCRIPTION("spike module - an example SPI driver");
+MODULE_DESCRIPTION("spike module - Example SPI driver");
 MODULE_LICENSE("GPL");
-MODULE_VERSION("0.1");
-
+MODULE_VERSION("0.2");
 
