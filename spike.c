@@ -91,6 +91,11 @@ static int spike_do_one_message(void)
 	if (down_interruptible(&spike_dev.spi_sem))
 		return -ERESTARTSYS;
 
+	if (!spike_dev.spi_device) {
+		up(&spike_dev.spi_sem);
+		return -ENODEV;
+	}
+
 	spike_prepare_spi_message();
 
 	status = spi_sync(spike_dev.spi_device, &spike_ctl.msg);
