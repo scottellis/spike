@@ -16,9 +16,6 @@
   You should have received a copy of the GNU General Public License
   along with this program; if not, write to the Free Software
   Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
-  
-  spike v0.2 does a loopback write/read of 4 bytes. 
-  Jumper MOSI to MISO, expansion board pins 5 to 7, for testing.
 */
 
 #include <linux/init.h>
@@ -221,7 +218,6 @@ static int __init add_spike_device_to_bus(void)
 		return -1;
 	}
 
-	/* CS1 = 0 */
 	spi_device->chip_select = SPI_BUS_CS1;
 
 	/* Check whether this SPI bus.cs is already claimed */
@@ -269,7 +265,7 @@ static int __init add_spike_device_to_bus(void)
 
 static struct spi_driver spike_driver = {
 	.driver = {
-		.name =	"spike",
+		.name =	this_driver_name,
 		.owner = THIS_MODULE,
 	},
 	.probe = spike_probe,
@@ -404,6 +400,7 @@ fail_2:
 fail_1:
 	return -1;
 }
+module_init(spike_init);
 
 static void __exit spike_exit(void)
 {
@@ -424,12 +421,10 @@ static void __exit spike_exit(void)
 	if (spike_dev.user_buff)
 		kfree(spike_dev.user_buff);
 }
-
-module_init(spike_init);
 module_exit(spike_exit);
 
 MODULE_AUTHOR("Scott Ellis");
-MODULE_DESCRIPTION("spike module - Example SPI driver");
+MODULE_DESCRIPTION("spike module - an example SPI driver");
 MODULE_LICENSE("GPL");
 MODULE_VERSION("0.2");
 
