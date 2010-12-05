@@ -65,6 +65,7 @@ struct spike_dev {
 	struct class *class;
 	struct spi_device *spi_device;
 	struct hrtimer timer;
+	u32 timer_period_sec;
 	u32 timer_period_ns;
 	u32 running;
 	char *user_buff;
@@ -134,7 +135,8 @@ static enum hrtimer_restart spike_timer_callback(struct hrtimer *timer)
 	}
 
 	hrtimer_forward_now(&spike_dev.timer, 
-		ktime_set(0, spike_dev.timer_period_ns));
+		ktime_set(spike_dev.timer_period_sec, 
+			spike_dev.timer_period_ns));
 	
 	return HRTIMER_RESTART;
 }
@@ -217,7 +219,8 @@ static ssize_t spike_write(struct file *filp, const char __user *buff,
 		spike_ctl.busy_counter = 0;
 
 		hrtimer_start(&spike_dev.timer, 
-				ktime_set(0, spike_dev.timer_period_ns),
+				ktime_set(spike_dev.timer_period_sec, 
+					spike_dev.timer_period_ns),
         	               	HRTIMER_MODE_REL);
 
 		spike_dev.running = 1; 
@@ -472,8 +475,11 @@ static int __init spike_init(void)
 		write_frequency = DEFAULT_WRITE_FREQUENCY;
 	}
 
+	if (write_frequency == 1)
+		spike_dev.timer_period_sec = 1;
+	else
+		spike_dev.timer_period_ns = 1000000000 / write_frequency; 
 
-	spike_dev.timer_period_ns = 1000000000 / write_frequency; 
 	hrtimer_init(&spike_dev.timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
 	spike_dev.timer.function = spike_timer_callback; 
 
