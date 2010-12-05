@@ -31,6 +31,7 @@
 #include <linux/moduleparam.h>
 #include <linux/hrtimer.h>
 
+#define NANOSECS_PER_SEC 1000000000
 #define SPI_BUFF_SIZE	16
 #define USER_BUFF_SIZE	128
 
@@ -58,7 +59,7 @@ struct spike_control {
 static struct spike_control spike_ctl;
 
 struct spike_dev {
-	struct semaphore spi_sem;
+	spinlock_t spi_lock;
 	struct semaphore fop_sem;
 	dev_t devt;
 	struct cdev cdev;
@@ -83,14 +84,7 @@ static void spike_completion_handler(void *arg)
 static int spike_queue_spi_write(void)
 {
 	int status;
-
-	if (down_interruptible(&spike_dev.spi_sem))
-		return -ERESTARTSYS;
-
-	if (!spike_dev.spi_device) {
-		up(&spike_dev.spi_sem);
-		return -ENODEV;
-	}
+	unsigned long flags;
 
 	spi_message_init(&spike_ctl.msg);
 
@@ -108,15 +102,18 @@ static int spike_queue_spi_write(void)
 
 	spi_message_add_tail(&spike_ctl.transfer, &spike_ctl.msg);
 
-	/* spi_async returns immediately */
-	status = spi_async(spike_dev.spi_device, &spike_ctl.msg);
+	spin_lock_irqsave(&spike_dev.spi_lock, flags);
+
+	if (spike_dev.spi_device)
+		status = spi_async(spike_dev.spi_device, &spike_ctl.msg);
+	else
+		status = -ENODEV;
+
+	spin_unlock_irqrestore(&spike_dev.spi_lock, flags);
 	
-	/* update the busy flag if spi_async() was good */
 	if (status == 0)
 		spike_ctl.busy = 1;
 	
-	up(&spike_dev.spi_sem);
-
 	return status;	
 }
 
@@ -257,29 +254,27 @@ static int spike_open(struct inode *inode, struct file *filp)
 
 static int spike_probe(struct spi_device *spi_device)
 {
-	if (down_interruptible(&spike_dev.spi_sem))
-		return -EBUSY;
+	unsigned long flags;
 
+	spin_lock_irqsave(&spike_dev.spi_lock, flags);
 	spike_dev.spi_device = spi_device;
-
-	up(&spike_dev.spi_sem);
+	spin_unlock_irqrestore(&spike_dev.spi_lock, flags);
 
 	return 0;
 }
 
 static int spike_remove(struct spi_device *spi_device)
 {
+	unsigned long flags;
+
 	if (spike_dev.running) {
 		hrtimer_cancel(&spike_dev.timer);
 		spike_dev.running = 0;
 	}
 
-	if (down_interruptible(&spike_dev.spi_sem))
-		return -EBUSY;
-	
+	spin_lock_irqsave(&spike_dev.spi_lock, flags);
 	spike_dev.spi_device = NULL;
-
-	up(&spike_dev.spi_sem);
+	spin_unlock_irqrestore(&spike_dev.spi_lock, flags);
 
 	return 0;
 }
@@ -455,7 +450,7 @@ static int __init spike_init(void)
 	memset(&spike_dev, 0, sizeof(spike_dev));
 	memset(&spike_ctl, 0, sizeof(spike_ctl));
 
-	sema_init(&spike_dev.spi_sem, 1);
+	spin_lock_init(&spike_dev.spi_lock);
 	sema_init(&spike_dev.fop_sem, 1);
 	
 	if (spike_init_cdev() < 0) 
@@ -467,8 +462,8 @@ static int __init spike_init(void)
 	if (spike_init_spi() < 0) 
 		goto fail_3;
 
-	/* enforce some range to the write frequency */
-	if (write_frequency < 1 || write_frequency > 1000) {
+	/* enforce some range to the write frequency, this is arbitrary */
+	if (write_frequency < 1 || write_frequency > 10000) {
 		printk(KERN_ALERT "write_frequency reset to %d", 
 			DEFAULT_WRITE_FREQUENCY);
 
@@ -478,10 +473,11 @@ static int __init spike_init(void)
 	if (write_frequency == 1)
 		spike_dev.timer_period_sec = 1;
 	else
-		spike_dev.timer_period_ns = 1000000000 / write_frequency; 
+		spike_dev.timer_period_ns = NANOSECS_PER_SEC / write_frequency; 
 
 	hrtimer_init(&spike_dev.timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
-	spike_dev.timer.function = spike_timer_callback; 
+	spike_dev.timer.function = spike_timer_callback;
+	/* leave the spike_dev.timer.data field = NULL, not needed */
 
 	return 0;
 
