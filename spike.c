@@ -35,7 +35,7 @@
 #define USER_BUFF_SIZE	128
 
 #define SPI_BUS 1
-#define SPI_BUS_CS1 0
+#define SPI_BUS_CS1 1
 #define SPI_BUS_SPEED 1000000
 
 
