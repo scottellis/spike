@@ -28,13 +28,20 @@
 #include <linux/spi/spi.h>
 #include <linux/string.h>
 #include <asm/uaccess.h>
+#include <linux/moduleparam.h>
+#include <linux/hrtimer.h>
 
 #define SPI_BUFF_SIZE	16
 #define USER_BUFF_SIZE	128
 
 #define SPI_BUS 1
-#define SPI_BUS_CS1 0
+#define SPI_BUS_CS1 1
 #define SPI_BUS_SPEED 1000000
+
+#define DEFAULT_WRITE_FREQUENCY 100
+static int write_frequency = DEFAULT_WRITE_FREQUENCY;
+module_param(write_frequency, int, S_IRUGO);
+MODULE_PARM_DESC(write_frequency, "Spike write frequency in Hz");
 
 
 const char this_driver_name[] = "spike";
@@ -42,8 +49,10 @@ const char this_driver_name[] = "spike";
 struct spike_control {
 	struct spi_message msg;
 	struct spi_transfer transfer;
+	u32 busy;
+	u32 spi_callbacks;
+	u32 busy_counter;
 	u8 *tx_buff; 
-	u8 *rx_buff;
 };
 
 static struct spike_control spike_ctl;
@@ -55,33 +64,22 @@ struct spike_dev {
 	struct cdev cdev;
 	struct class *class;
 	struct spi_device *spi_device;
+	struct hrtimer timer;
+	u32 timer_period_ns;
+	u32 running;
 	char *user_buff;
-	u8 test_data;	
 };
 
 static struct spike_dev spike_dev;
 
 
-static void spike_prepare_spi_message(void)
-{
-	spi_message_init(&spike_ctl.msg);
-
-	/* put some changing values in tx_buff for testing */	
-	spike_ctl.tx_buff[0] = spike_dev.test_data++;
-	spike_ctl.tx_buff[1] = spike_dev.test_data++;
-	spike_ctl.tx_buff[2] = spike_dev.test_data++;
-	spike_ctl.tx_buff[3] = spike_dev.test_data++;
-
-	memset(spike_ctl.rx_buff, 0, SPI_BUFF_SIZE);
-
-	spike_ctl.transfer.tx_buf = spike_ctl.tx_buff;
-	spike_ctl.transfer.rx_buf = spike_ctl.rx_buff;
-	spike_ctl.transfer.len = 4;
-
-	spi_message_add_tail(&spike_ctl.transfer, &spike_ctl.msg);
+static void spike_completion_handler(void *arg)
+{	
+	spike_ctl.spi_callbacks++;
+	spike_ctl.busy = 0;
 }
 
-static int spike_do_one_message(void)
+static int spike_queue_spi_write(void)
 {
 	int status;
 
@@ -93,13 +91,52 @@ static int spike_do_one_message(void)
 		return -ENODEV;
 	}
 
-	spike_prepare_spi_message();
+	spi_message_init(&spike_ctl.msg);
 
-	status = spi_sync(spike_dev.spi_device, &spike_ctl.msg);
+	/* this gets called when the spi_message completes */
+	spike_ctl.msg.complete = spike_completion_handler;
+	spike_ctl.msg.context = NULL;
+
+	/* write some toggling bit patterns, doesn't really matter */	
+	spike_ctl.tx_buff[0] = 0xAA;
+	spike_ctl.tx_buff[1] = 0x55;
+
+	spike_ctl.transfer.tx_buf = spike_ctl.tx_buff;
+	spike_ctl.transfer.rx_buf = NULL;
+	spike_ctl.transfer.len = 2;
+
+	spi_message_add_tail(&spike_ctl.transfer, &spike_ctl.msg);
+
+	/* spi_async returns immediately */
+	status = spi_async(spike_dev.spi_device, &spike_ctl.msg);
+	
+	/* update the busy flag if spi_async() was good */
+	if (status == 0)
+		spike_ctl.busy = 1;
 	
 	up(&spike_dev.spi_sem);
 
 	return status;	
+}
+
+static enum hrtimer_restart spike_timer_callback(struct hrtimer *timer)
+{
+	if (!spike_dev.running) {
+		return HRTIMER_NORESTART;
+	}
+
+	/* busy means the previous message has not completed */
+	if (spike_ctl.busy) {
+		spike_ctl.busy_counter++;
+	}
+	else if (spike_queue_spi_write() != 0) {
+		return HRTIMER_NORESTART;
+	}
+
+	hrtimer_forward_now(&spike_dev.timer, 
+		ktime_set(0, spike_dev.timer_period_ns));
+	
+	return HRTIMER_RESTART;
 }
 
 static ssize_t spike_read(struct file *filp, char __user *buff, size_t count,
@@ -117,22 +154,11 @@ static ssize_t spike_read(struct file *filp, char __user *buff, size_t count,
 	if (down_interruptible(&spike_dev.fop_sem)) 
 		return -ERESTARTSYS;
 
-	status = spike_do_one_message();
-
-	if (status) {
-		sprintf(spike_dev.user_buff, 
-			"spike_do_one_message failed : %d\n",
-			status);
-	}
-	else {
-		sprintf(spike_dev.user_buff, 
-			"Status: %d\nTX: %d %d %d %d\nRX: %d %d %d %d\n",
-			spike_ctl.msg.status,
-			spike_ctl.tx_buff[0], spike_ctl.tx_buff[1], 
-			spike_ctl.tx_buff[2], spike_ctl.tx_buff[3],
-			spike_ctl.rx_buff[0], spike_ctl.rx_buff[1], 
-			spike_ctl.rx_buff[2], spike_ctl.rx_buff[3]);
-	}
+	sprintf(spike_dev.user_buff, 
+			"%s|%u|%u\n",
+			spike_dev.running ? "Running" : "Stopped",
+			spike_ctl.spi_callbacks,
+			spike_ctl.busy_counter);
 		
 	len = strlen(spike_dev.user_buff);
  
@@ -150,6 +176,62 @@ static ssize_t spike_read(struct file *filp, char __user *buff, size_t count,
 	up(&spike_dev.fop_sem);
 
 	return status;	
+}
+
+/*
+ * We accept two commands 'start' or 'stop' and ignore anything else.
+ */
+static ssize_t spike_write(struct file *filp, const char __user *buff,
+		size_t count, loff_t *f_pos)
+{
+	size_t len;	
+	ssize_t status = 0;
+
+	if (down_interruptible(&spike_dev.fop_sem))
+		return -ERESTARTSYS;
+
+	memset(spike_dev.user_buff, 0, 16);
+	len = count > 8 ? 8 : count;
+
+	if (copy_from_user(spike_dev.user_buff, buff, len)) {
+		status = -EFAULT;
+		goto spike_write_done;
+	}
+
+	/* we'll act as if we looked at all the data */
+	status = count;
+
+	/* but we only care about the first 5 characters */
+	if (!strnicmp(spike_dev.user_buff, "start", 5)) {
+		if (spike_dev.running) {
+			printk(KERN_ALERT "already running\n");
+			goto spike_write_done;
+		}
+
+		if (spike_ctl.busy) {
+			printk(KERN_ALERT "waiting on a spi transaction\n");
+			goto spike_write_done;
+		}
+
+		spike_ctl.spi_callbacks = 0;		
+		spike_ctl.busy_counter = 0;
+
+		hrtimer_start(&spike_dev.timer, 
+				ktime_set(0, spike_dev.timer_period_ns),
+        	               	HRTIMER_MODE_REL);
+
+		spike_dev.running = 1; 
+	} 
+	else if (!strnicmp(spike_dev.user_buff, "stop", 4)) {
+		hrtimer_cancel(&spike_dev.timer);
+		spike_dev.running = 0;
+	}
+
+spike_write_done:
+
+	up(&spike_dev.fop_sem);
+
+	return status;
 }
 
 static int spike_open(struct inode *inode, struct file *filp)
@@ -184,6 +266,11 @@ static int spike_probe(struct spi_device *spi_device)
 
 static int spike_remove(struct spi_device *spi_device)
 {
+	if (spike_dev.running) {
+		hrtimer_cancel(&spike_dev.timer);
+		spike_dev.running = 0;
+	}
+
 	if (down_interruptible(&spike_dev.spi_sem))
 		return -EBUSY;
 	
@@ -282,12 +369,6 @@ static int __init spike_init_spi(void)
 		goto spike_init_error;
 	}
 
-	spike_ctl.rx_buff = kmalloc(SPI_BUFF_SIZE, GFP_KERNEL | GFP_DMA);
-	if (!spike_ctl.rx_buff) {
-		error = -ENOMEM;
-		goto spike_init_error;
-	}
-
 	error = spi_register_driver(&spike_driver);
 	if (error < 0) {
 		printk(KERN_ALERT "spi_register_driver() failed %d\n", error);
@@ -310,17 +391,13 @@ spike_init_error:
 		spike_ctl.tx_buff = 0;
 	}
 
-	if (spike_ctl.rx_buff) {
-		kfree(spike_ctl.rx_buff);
-		spike_ctl.rx_buff = 0;
-	}
-	
 	return error;
 }
 
 static const struct file_operations spike_fops = {
 	.owner =	THIS_MODULE,
 	.read = 	spike_read,
+	.write = 	spike_write,
 	.open =		spike_open,	
 };
 
@@ -387,6 +464,19 @@ static int __init spike_init(void)
 	if (spike_init_spi() < 0) 
 		goto fail_3;
 
+	/* enforce some range to the write frequency */
+	if (write_frequency < 1 || write_frequency > 1000) {
+		printk(KERN_ALERT "write_frequency reset to %d", 
+			DEFAULT_WRITE_FREQUENCY);
+
+		write_frequency = DEFAULT_WRITE_FREQUENCY;
+	}
+
+
+	spike_dev.timer_period_ns = 1000000000 / write_frequency; 
+	hrtimer_init(&spike_dev.timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
+	spike_dev.timer.function = spike_timer_callback; 
+
 	return 0;
 
 fail_3:
@@ -415,9 +505,6 @@ static void __exit spike_exit(void)
 	if (spike_ctl.tx_buff)
 		kfree(spike_ctl.tx_buff);
 
-	if (spike_ctl.rx_buff)
-		kfree(spike_ctl.rx_buff);
-
 	if (spike_dev.user_buff)
 		kfree(spike_dev.user_buff);
 }
@@ -426,5 +513,5 @@ module_exit(spike_exit);
 MODULE_AUTHOR("Scott Ellis");
 MODULE_DESCRIPTION("spike module - an example SPI driver");
 MODULE_LICENSE("GPL");
-MODULE_VERSION("0.2");
+MODULE_VERSION("0.3");
 
