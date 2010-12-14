@@ -1,0 +1,33 @@
+diff --git git/drivers/spi/omap2_mcspi.c git/drivers/spi/omap2_mcspi.c
+index fe1b56d..7b51d4e 100644
+--- git/drivers/spi/omap2_mcspi.c
++++ git/drivers/spi/omap2_mcspi.c
+@@ -578,18 +578,24 @@ static int omap2_mcspi_setup_transfer(struct spi_device *spi,
+ 	struct spi_master *spi_cntrl;
+ 	u32 l = 0, div = 0;
+ 	u8 word_len = spi->bits_per_word;
++	u32 speed_hz = spi->max_speed_hz;
+ 
+ 	mcspi = spi_master_get_devdata(spi->master);
+ 	spi_cntrl = mcspi->master;
+ 
+-	if (t != NULL && t->bits_per_word)
+-		word_len = t->bits_per_word;
++	if (t != NULL) {
++		if (t->bits_per_word)
++			word_len = t->bits_per_word;
++
++		if (t->speed_hz)
++			speed_hz = t->speed_hz;
++	}
+ 
+ 	cs->word_len = word_len;
+ 
+-	if (spi->max_speed_hz) {
++	if (speed_hz) {
+ 		while (div <= 15 && (OMAP2_MCSPI_MAX_FREQ / (1 << div))
+-					> spi->max_speed_hz)
++					> speed_hz)
+ 			div++;
+ 	} else
+ 		div = 15;

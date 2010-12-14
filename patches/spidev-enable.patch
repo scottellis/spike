@@ -1,0 +1,34 @@
+diff --git git/arch/arm/mach-omap2/board-overo.c git/arch/arm/mach-omap2/board-overo.c
+index 95efc77..315daa7 100644
+--- git/arch/arm/mach-omap2/board-overo.c
++++ git/arch/arm/mach-omap2/board-overo.c
+@@ -628,6 +628,14 @@ static struct spi_board_info overo_spi_board_info[] __initdata = {
+ 		.irq			= OMAP_GPIO_IRQ(OVERO_GPIO_PENDOWN),
+ 		.platform_data		= &ads7846_config,
+ 	},
++#elif defined(CONFIG_SPI_SPIDEV) || defined(CONFIG_SPI_SPIDEV_MODULE)
++	{
++		.modalias		= "spidev",
++		.bus_num		= 1,
++		.chip_select		= 0,
++		.max_speed_hz		= 1000000,
++		.mode			= SPI_MODE_0,
++	},
+ #endif
+ #if defined(CONFIG_PANEL_LGPHILIPS_LB035Q02) || \
+ 	defined(CONFIG_PANEL_LGPHILIPS_LB035Q02_MODULE)
+@@ -638,6 +646,14 @@ static struct spi_board_info overo_spi_board_info[] __initdata = {
+ 		.max_speed_hz		= 500000,
+ 		.mode			= SPI_MODE_3,
+ 	},
++#elif defined(CONFIG_SPI_SPIDEV) || defined(CONFIG_SPI_SPIDEV_MODULE)
++	{
++		.modalias		= "spidev",
++		.bus_num		= 1,
++		.chip_select		= 1,
++		.max_speed_hz		= 1000000,
++		.mode			= SPI_MODE_0,
++	},
+ #endif
+ };
+ 
