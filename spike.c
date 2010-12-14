@@ -213,7 +213,6 @@ static int __init add_spike_device_to_bus(void)
 	spi_device = spi_alloc_device(spi_master);
 	if (!spi_device) {
 		put_device(&spi_master->dev);
-		status = -1;
 		printk(KERN_ALERT "spi_alloc_device() failed\n");
 		return -1;
 	}
@@ -249,8 +248,8 @@ static int __init add_spike_device_to_bus(void)
 		spi_device->controller_state = NULL;
 		spi_device->controller_data = NULL;
 		strlcpy(spi_device->modalias, this_driver_name, SPI_NAME_SIZE);
-		status = spi_add_device(spi_device);
 		
+		status = spi_add_device(spi_device);		
 		if (status < 0) {	
 			spi_dev_put(spi_device);
 			printk(KERN_ALERT "spi_add_device() failed: %d\n", 
