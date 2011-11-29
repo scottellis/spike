@@ -323,6 +323,7 @@ module_init(spike_init);
 
 static void __exit spike_exit(void)
 {
+	spi_unregister_device(spike_dev.spi_device);
 	spi_unregister_driver(&spike_driver);
 
 	device_destroy(spike_dev.class, spike_dev.devt);
